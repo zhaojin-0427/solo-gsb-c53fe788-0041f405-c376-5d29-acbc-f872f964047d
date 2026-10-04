@@ -163,3 +163,132 @@ class PlanResponse(BaseModel):
         description="无解原因：CAPACITY（容量）或 PRECEDENCE（前置冲突）"
     )
     solver_message: str = ""
+
+
+# ======================== POST /executions/audit ========================
+
+
+class ExecutedSegment(BaseModel):
+    """一个已实际执行的层段：实测起止秒与段前实测 purge。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(..., min_length=1, description="所属作业 ID")
+    segment_index: int = Field(..., ge=1, description="作业内层段序号，从 1 开始")
+    start_seconds: int = Field(..., ge=0, description="实测开始时刻（秒，相对开工时刻 0）")
+    end_seconds: int = Field(..., ge=0, description="实测结束时刻（秒）")
+    purge_before_mm3: int = Field(
+        ..., ge=0, description="该段开始前实际排出的 purge 体积（mm^3）"
+    )
+
+    @model_validator(mode="after")
+    def _check_interval(self) -> "ExecutedSegment":
+        if self.end_seconds < self.start_seconds:
+            raise ValueError("end_seconds 不能早于 start_seconds（起止倒置）")
+        return self
+
+
+class AuditRequest(PlanRequest):
+    """POST /executions/audit 的请求体：/plans 全部参数 + 实测执行层段序列。
+
+    基类 :class:`PlanRequest` 的校验（作业、材料、purge 矩阵等）原样生效；
+    本类额外校验已执行层段：未知作业 / 未知层序、重复层段一律 422
+    （起止倒置在 :class:`ExecutedSegment` 内拦截）。
+    """
+
+    executions: list[ExecutedSegment] = Field(
+        ...,
+        description=(
+            "按实际执行顺序排列的已完成层段；允许只提交前缀（作业未完工）。"
+            "跨作业可交错，同一作业的层序合法性在回放时检查（违规而非 422）。"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_executions(self) -> "AuditRequest":
+        seg_counts = {j.job_id: len(j.segments) for j in self.jobs}
+        seen: set = set()
+        for ex in self.executions:
+            if ex.job_id not in seg_counts:
+                raise ValueError(f"executions 引用了未知作业: {ex.job_id}")
+            if ex.segment_index > seg_counts[ex.job_id]:
+                raise ValueError(
+                    f"executions 引用了未知层段: 作业 {ex.job_id} 只有 "
+                    f"{seg_counts[ex.job_id]} 段，却给出第 {ex.segment_index} 段"
+                )
+            key = (ex.job_id, ex.segment_index)
+            if key in seen:
+                raise ValueError(
+                    f"executions 中层段重复: 作业 {ex.job_id} 第 {ex.segment_index} 段"
+                )
+            seen.add(key)
+        return self
+
+
+class ReplayedSegment(BaseModel):
+    """回放序列中的单个已执行层段（时间全部采用实测值，不做紧密重排）。"""
+
+    order: int = Field(..., description="在实测执行序列中的序号，从 1 开始")
+    job_id: str
+    segment_index: int
+    material_id: str
+    start_seconds: int = Field(..., description="实测开始时刻")
+    end_seconds: int = Field(..., description="实测结束时刻")
+    print_seconds: int = Field(..., description="实测打印耗时 = end - start")
+    idle_seconds_before: int = Field(
+        ...,
+        description=(
+            "该段开始距上一已执行层段结束的空闲秒数（首段相对时刻 0）；"
+            "重叠时为负值"
+        ),
+    )
+    material_switched: bool = Field(
+        ..., description="相对上一已执行层段（首段相对初始材料）是否发生换料"
+    )
+    purge_required_mm3: int = Field(
+        ..., description="按材料矩阵该换料所需的 purge；同材料为 0"
+    )
+    purge_before_mm3: int = Field(..., description="段前实测 purge（按此值扣容量）")
+
+
+class ExecutionViolation(BaseModel):
+    """回放中发现的一处违规（违规位置由 order/job_id/segment_index 定位）。"""
+
+    order: int = Field(..., description="违规层段在实测执行序列中的序号")
+    job_id: str
+    segment_index: int
+    code: str = Field(
+        ...,
+        description=(
+            "OVERLAP / LAYER_ORDER_INVALID / SWITCH_TIME_INSUFFICIENT / "
+            "PURGE_SHORTFALL / SAME_MATERIAL_PURGE_NONZERO / PURGE_CAPACITY_EXCEEDED"
+        ),
+    )
+    message: str
+    detail: Optional[dict] = Field(
+        None, description="违规相关的实测值 / 要求值等定位信息"
+    )
+
+
+class AuditResponse(BaseModel):
+    status: str = Field(
+        ...,
+        description="IN_PROGRESS（进行中）/ COMPLETED（全部完成且无违规）/ VIOLATED（存在违规）",
+    )
+    segments_total: int = Field(..., description="请求中全部层段数")
+    segments_executed: int = Field(..., description="已执行层段数")
+    purge_used_mm3: int = Field(..., description="已用 purge（逐段按实测值累计）")
+    purge_remaining_mm3: int = Field(
+        ..., description="剩余 purge = 总容量 - 已用；超容时为负值"
+    )
+    total_tardiness_seconds: int = Field(
+        ..., description="已完工（全部层段均已执行）作业的逾期合计；未完工前缀不计"
+    )
+    makespan_seconds: int = Field(
+        ..., description="最后一个已执行层段的实测结束时刻（无执行时为 0）"
+    )
+    job_tardiness: list[JobTardiness] = Field(
+        default_factory=list, description="完工作业逾期明细（未完工的作业不计入）"
+    )
+    replay: list[ReplayedSegment] = Field(default_factory=list)
+    violations: list[ExecutionViolation] = Field(default_factory=list)

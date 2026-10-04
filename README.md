@@ -20,6 +20,12 @@
 返回切换记录、purge 余量、逐作业逾期明细与求解状态；未在限时内证明最优时
 **不会**标记为最优。
 
+服务另提供 **`POST /executions/audit`（执行核验）**：提交与 `/plans` 相同的
+规划参数，以及按**实际执行顺序**排列的已完成层段（作业 ID、层序、实测起止秒、
+段前实测 purge）。核验经同样的 `PlanRequest` 校验、用 `build_instance` 构建
+基准后**逐段按实测时间线回放**——保留空闲与实际耗时，不按紧密排产重算——返回
+进行中 / 完成 / 违规状态、已用与剩余 purge、完工作业逾期与违规位置。
+
 ---
 
 ## 一、Docker Compose 一键启动
@@ -343,6 +349,275 @@ CP-SAT 可能来不及给出任何解，服务改用免求解的构造性候选�
 | `INFEASIBLE` | `false` | 无解，见 `infeasible_reason` |
 | `UNKNOWN` | `false` | 限时内连可行计划都无法给出（构造性候选也不满足容量） |
 
+### `POST /executions/audit` 执行核验
+
+提交 `/plans` 的全部请求参数，外加一个 `executions` 数组——按**实际执行顺序**
+排列的已完成层段（允许只提交一个未完工前缀；跨作业可以交错）。服务先经与
+`/plans` 完全相同的 `PlanRequest` 校验，再用 `build_instance` 构建基准，然后
+**按实测时间线逐段回放**：
+
+- **保留空闲与实际耗时，不按紧密排产重算**：段的开始/结束时刻、段间空闲一律
+  采用提交的实测值；逾期也按实测完工时刻计算；
+- **换料前须留足 `switch_seconds`**：某段材料与上一已执行层段不同（首段相对
+  `initial_material`）时，段前空闲不得少于切换耗时；
+- **段前 purge 不低于矩阵需求**：实测值低于 `purge_matrix[from][to]` 即违规；
+  容量始终**按实测值**扣减（即使实测值不达标也照扣）；
+- **同材料段前 purge 为零**：与上一已执行层段材料相同时不换料，段前 purge
+  必须为 0；
+- **跨作业可交错，但各自层序须合法**：作业 J 第 k 段执行时，其第 k-1 段必须
+  已执行；
+- **单喷头串行**：层段实测开始不得早于上一已执行层段的实测结束（零耗时层段
+  首尾相接合法）。
+
+请求字段（`executions[]` 部分，其余字段与 `/plans` 完全一致）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `executions` | 数组（可为空） | 按实际执行顺序排列的已完成层段 |
+| `executions[].job_id` | 非空字符串 | 作业 ID，必须在 `jobs` 中存在 |
+| `executions[].segment_index` | 正整数 | 作业内层段序号，必须在该作业层段范围内 |
+| `executions[].start_seconds` | 非负整数 | 实测开始时刻（秒，相对开工时刻 0） |
+| `executions[].end_seconds` | 非负整数 | 实测结束时刻（秒），不得早于开始时刻 |
+| `executions[].purge_before_mm3` | 非负整数 | 段前实测 purge（mm³），按此值扣容量 |
+
+**返回状态**（响应字段 `status`）：
+
+- `IN_PROGRESS`：无违规且尚未提交全部层段（`executions` 为空也是进行中）；
+- `COMPLETED`：无违规且全部层段均已提交；
+- `VIOLATED`：回放中发现任何违规——**即使全部层段都已提交也不能标完成**。
+
+完工作业逾期只统计**全部层段均已执行**的作业；未完工前缀不计逾期。
+响应主要字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `segments_total` / `segments_executed` | 基准层段总数 / 已提交执行的层段数 |
+| `purge_used_mm3` | 逐段按实测 `purge_before_mm3` 累计的已用 purge |
+| `purge_remaining_mm3` | 总容量 − 已用；超容时为负值 |
+| `total_tardiness_seconds` / `job_tardiness[]` | 仅完工作业的逾期合计与明细 |
+| `makespan_seconds` | 最后一个已执行层段的实测结束时刻（无执行时为 0） |
+| `replay[]` | 逐段回放明细：实测起止、实测耗时、段前空闲、是否换料、矩阵需求 purge、实测 purge |
+| `violations[]` | 违规位置（`order` / `job_id` / `segment_index`）、代码与定位信息 |
+
+违规代码 `violations[].code`：
+
+| 代码 | 触发条件 |
+| --- | --- |
+| `OVERLAP` | 实测开始早于上一已执行层段结束（层段重叠） |
+| `LAYER_ORDER_INVALID` | 该作业第 k 段执行时第 k-1 段尚未执行 |
+| `SWITCH_TIME_INSUFFICIENT` | 换料前空闲少于 `switch_seconds` |
+| `PURGE_SHORTFALL` | 段前实测 purge 低于矩阵需求 |
+| `SAME_MATERIAL_PURGE_NONZERO` | 同材料相邻（无需换料）但段前 purge 非零 |
+| `PURGE_CAPACITY_EXCEEDED` | 按实测值累计扣减后 purge 超出总容量 |
+
+#### 核验请求示例：合规完成
+
+请求体见 `examples/request_audit_completed.json`（与 `/plans` 最优计划相同的
+执行顺序，保留每次换料的 10 秒留时）：
+
+```bash
+curl -X POST http://localhost:8000/executions/audit \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_audit_completed.json
+```
+
+**实际响应**：
+
+```json
+{
+  "status": "COMPLETED",
+  "segments_total": 4,
+  "segments_executed": 4,
+  "purge_used_mm3": 200,
+  "purge_remaining_mm3": 200,
+  "total_tardiness_seconds": 0,
+  "makespan_seconds": 210,
+  "job_tardiness": [
+    {"job_id": "J1", "completion_seconds": 100, "deadline_seconds": 120, "tardy_seconds": 0},
+    {"job_id": "J2", "completion_seconds": 210, "deadline_seconds": 220, "tardy_seconds": 0}
+  ],
+  "replay": [
+    {"order": 1, "job_id": "J1", "segment_index": 1, "material_id": "PLA",
+     "start_seconds": 0, "end_seconds": 60, "print_seconds": 60,
+     "idle_seconds_before": 0, "material_switched": false,
+     "purge_required_mm3": 0, "purge_before_mm3": 0},
+    {"order": 2, "job_id": "J1", "segment_index": 2, "material_id": "ABS",
+     "start_seconds": 70, "end_seconds": 100, "print_seconds": 30,
+     "idle_seconds_before": 10, "material_switched": true,
+     "purge_required_mm3": 120, "purge_before_mm3": 120},
+    {"order": 3, "job_id": "J2", "segment_index": 1, "material_id": "ABS",
+     "start_seconds": 100, "end_seconds": 180, "print_seconds": 80,
+     "idle_seconds_before": 0, "material_switched": false,
+     "purge_required_mm3": 0, "purge_before_mm3": 0},
+    {"order": 4, "job_id": "J2", "segment_index": 2, "material_id": "PLA",
+     "start_seconds": 190, "end_seconds": 210, "print_seconds": 20,
+     "idle_seconds_before": 10, "material_switched": true,
+     "purge_required_mm3": 80, "purge_before_mm3": 80}
+  ],
+  "violations": []
+}
+```
+
+`replay` 中两次换料的段前空闲恰为 `switch_seconds=10`，同材料相邻的 J2.1
+段前 purge 为 0；J1.2 与 J2.1 都是 ABS，跨作业相邻没有额外消耗。
+
+#### 核验请求示例：进行中前缀（未完工不计逾期）
+
+只提交前两段（J1 全部完成，J2 未开始），并把 J1 截止时刻提前到 90 秒：
+
+```bash
+curl -X POST http://localhost:8000/executions/audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jobs": [
+      {"job_id": "J1", "deadline_seconds": 90, "segments": [
+        {"material_id": "PLA", "print_seconds": 60, "volume_mm3": 100},
+        {"material_id": "ABS", "print_seconds": 30, "volume_mm3": 40}]},
+      {"job_id": "J2", "deadline_seconds": 220, "segments": [
+        {"material_id": "ABS", "print_seconds": 80, "volume_mm3": 120},
+        {"material_id": "PLA", "print_seconds": 20, "volume_mm3": 30}]}
+    ],
+    "initial_material": "PLA",
+    "purge_matrix": {"PLA": {"PLA": 0, "ABS": 120}, "ABS": {"PLA": 80, "ABS": 0}},
+    "switch_seconds": 10,
+    "total_purge_capacity_mm3": 400,
+    "executions": [
+      {"job_id": "J1", "segment_index": 1, "start_seconds": 0,  "end_seconds": 60,  "purge_before_mm3": 0},
+      {"job_id": "J1", "segment_index": 2, "start_seconds": 75, "end_seconds": 105, "purge_before_mm3": 120}
+    ]
+  }'
+```
+
+**实际响应**（`replay` 与其余字段从略）：
+
+```json
+{
+  "status": "IN_PROGRESS",
+  "segments_total": 4,
+  "segments_executed": 2,
+  "purge_used_mm3": 120,
+  "purge_remaining_mm3": 280,
+  "total_tardiness_seconds": 15,
+  "makespan_seconds": 105,
+  "job_tardiness": [
+    {"job_id": "J1", "completion_seconds": 105, "deadline_seconds": 90, "tardy_seconds": 15}
+  ],
+  "replay": [ "..." ],
+  "violations": []
+}
+```
+
+J1 两段已全部执行故计入逾期（完工 105 − 截止 90 = 15 秒）；段前 15 秒空闲
+（>10 秒切换耗时）原样保留；J2 未完工，不出现在逾期明细中。
+
+#### 核验请求示例：违规（重叠 / 层序错误 / 超容不能标完成）
+
+请求体见 `examples/request_audit_violation.json`：四段全部提交，但 J2 的第 2
+段排在第 1 段之前，且最后一段换料只留了 6 秒、段前 purge 只有 40 mm³
+（需求 120）。
+
+```bash
+curl -X POST http://localhost:8000/executions/audit \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_audit_violation.json
+```
+
+**实际响应**（`replay` 完整，违规处全部列出）：
+
+```json
+{
+  "status": "VIOLATED",
+  "segments_total": 4,
+  "segments_executed": 4,
+  "purge_used_mm3": 240,
+  "purge_remaining_mm3": 160,
+  "total_tardiness_seconds": 0,
+  "makespan_seconds": 210,
+  "job_tardiness": [
+    {"job_id": "J1", "completion_seconds": 100, "deadline_seconds": 120, "tardy_seconds": 0},
+    {"job_id": "J2", "completion_seconds": 210, "deadline_seconds": 220, "tardy_seconds": 0}
+  ],
+  "replay": [
+    {"order": 1, "job_id": "J1", "segment_index": 1, "material_id": "PLA",
+     "start_seconds": 0, "end_seconds": 60, "print_seconds": 60,
+     "idle_seconds_before": 0, "material_switched": false,
+     "purge_required_mm3": 0, "purge_before_mm3": 0},
+    {"order": 2, "job_id": "J1", "segment_index": 2, "material_id": "ABS",
+     "start_seconds": 70, "end_seconds": 100, "print_seconds": 30,
+     "idle_seconds_before": 10, "material_switched": true,
+     "purge_required_mm3": 120, "purge_before_mm3": 120},
+    {"order": 3, "job_id": "J2", "segment_index": 2, "material_id": "PLA",
+     "start_seconds": 110, "end_seconds": 130, "print_seconds": 20,
+     "idle_seconds_before": 10, "material_switched": true,
+     "purge_required_mm3": 80, "purge_before_mm3": 80},
+    {"order": 4, "job_id": "J2", "segment_index": 1, "material_id": "ABS",
+     "start_seconds": 136, "end_seconds": 210, "print_seconds": 74,
+     "idle_seconds_before": 6, "material_switched": true,
+     "purge_required_mm3": 120, "purge_before_mm3": 40}
+  ],
+  "violations": [
+    {"order": 3, "job_id": "J2", "segment_index": 2,
+     "code": "LAYER_ORDER_INVALID",
+     "message": "作业 J2 第 2 段在其第 1 段之前执行，作业内层序非法（跨作业可交错，但各作业层序须合法）",
+     "detail": {"missing_predecessor": 1}},
+    {"order": 4, "job_id": "J2", "segment_index": 1,
+     "code": "SWITCH_TIME_INSUFFICIENT",
+     "message": "PLA→ABS 换料前须留足 switch_seconds=10 秒，实际仅有 6 秒空闲",
+     "detail": {"from_material": "PLA", "to_material": "ABS", "gap_seconds": 6,
+                "required_switch_seconds": 10,
+                "previous_end_seconds": 130, "start_seconds": 136}},
+    {"order": 4, "job_id": "J2", "segment_index": 1,
+     "code": "PURGE_SHORTFALL",
+     "message": "PLA→ABS 换料段前实测 purge 40 mm^3 低于矩阵需求 120 mm^3",
+     "detail": {"from_material": "PLA", "to_material": "ABS",
+                "purge_before_mm3": 40, "purge_required_mm3": 120}}
+  ]
+}
+```
+
+虽然四段全部提交且没有逾期，`status` 仍是 `VIOLATED` 而非 `COMPLETED`；
+最后一段实测耗时 74 秒（基准中该段 `print_seconds=80`）与段前 6 秒空闲都
+如实保留，不重算。purge 容量始终按实测值扣减（0+120+80+40=240），若
+实测 purge 累计超出 `total_purge_capacity_mm3`，越界的那一段会带
+`PURGE_CAPACITY_EXCEEDED` 违规，且 `purge_remaining_mm3` 如实给出负值。
+
+#### 核验请求的 422
+
+以下情况在进入回放前即返回 **422**（与 `/plans` 相同的 Pydantic 错误体）：
+
+- `executions[]` 引用了**未知作业**或**未知层段**（层序超出该作业段数）；
+- 同一 `(job_id, segment_index)` **重复**出现；
+- `end_seconds < start_seconds`（**起止倒置**）、时间或 purge 为负；
+- 缺少 `executions` 字段、出现未声明的额外字段；
+- `/plans` 参数本身非法（作业数、purge 矩阵完整性等，规则同前）。
+
+注意：**层序错误**（第 k 段早于第 k-1 段执行）与**时间重叠**是执行违规
+（200 + `VIOLATED`），因为它们只能在按实际顺序回放时发现；只有“引用了
+不存在的层段/作业”“同一段报了两次”这类请求格式问题才是 422。
+
+```bash
+curl -i -X POST http://localhost:8000/executions/audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jobs": [
+      {"job_id": "J1", "deadline_seconds": 100, "segments": [
+        {"material_id": "PLA", "print_seconds": 10, "volume_mm3": 1}]},
+      {"job_id": "J2", "deadline_seconds": 100, "segments": [
+        {"material_id": "PLA", "print_seconds": 10, "volume_mm3": 1}]}
+    ],
+    "initial_material": "PLA",
+    "purge_matrix": {"PLA": {"PLA": 0}},
+    "switch_seconds": 0,
+    "total_purge_capacity_mm3": 0,
+    "executions": [
+      {"job_id": "J1", "segment_index": 9,
+       "start_seconds": 0, "end_seconds": 10, "purge_before_mm3": 0}
+    ]
+  }'
+# HTTP/1.1 422 Unprocessable Entity
+# ... "msg": "executions 引用了未知层段: 作业 J1 只有 1 段，却给出第 9 段" ...
+```
+
 ### 非法数据（HTTP 422）
 
 以下情况返回 **422 Unprocessable Entity**（FastAPI/Pydantic 标准错误体，含字段定位）：
@@ -352,6 +627,11 @@ CP-SAT 可能来不及给出任何解，服务改用免求解的构造性候选�
 - purge 矩阵单元格为负、对角非 0；
 - 初始材料或某层段材料在矩阵中缺行或缺列；
 - 出现未声明的额外字段、类型错误等。
+
+`POST /executions/audit` 继承上述全部规则，此外 `executions[]` 引用未知
+作业 / 未知层段、层段重复、`end_seconds < start_seconds`（起止倒置）、
+时间或 purge 为负、缺少 `executions` 字段同样返回 422（详见上文
+[核验请求的 422](#核验请求的-422)）。
 
 示例：
 
@@ -372,16 +652,20 @@ curl -i -X POST http://localhost:8000/plans \
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 应用：GET /health、POST /plans
+│   ├── main.py        # FastAPI 应用：GET /health、POST /plans、POST /executions/audit
 │   ├── schemas.py     # 请求/响应模型与 422 输入校验
-│   └── solver.py      # CP-SAT 建模、分阶段求解与字典序决胜
+│   ├── solver.py      # CP-SAT 建模、分阶段求解与字典序决胜
+│   └── audit.py       # 执行核验：基准构建后按实测时间线逐段回放
 ├── examples/
-│   ├── request.json              # 可行示例
-│   ├── request_long_job.json     # 长作业示例（单作业 25 段）
-│   ├── request_interleave.json   # 按材料交错示例（两个 25 段 A→B→A 作业，容量 2）
-│   └── request_infeasible.json   # 容量超限示例
+│   ├── request.json                     # 可行示例
+│   ├── request_long_job.json            # 长作业示例（单作业 25 段）
+│   ├── request_interleave.json          # 按材料交错示例（两个 25 段 A→B→A 作业，容量 2）
+│   ├── request_infeasible.json          # 容量超限示例
+│   ├── request_audit_completed.json     # 核验示例：合规完成
+│   └── request_audit_violation.json     # 核验示例：层序错误 + 换料留时/purge 违规
 ├── tests/
-│   └── test_plans.py  # 16 个端到端测试（最优性、无解、交错、优先级、长作业、超时兜底、422 等）
+│   ├── test_plans.py            # 16 个端到端测试（最优性、无解、交错、优先级、长作业、超时兜底、422 等）
+│   └── test_executions_audit.py # 19 个端到端测试（完成/进行中、保留空闲、重叠、层序、换料留时、purge 与超容、422 等）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -412,3 +696,29 @@ curl -i -X POST http://localhost:8000/plans \
   明细，状态如实标为 `FEASIBLE`，仅当兜底排列也超容时才返回 `UNKNOWN`。
   三级目标的最优性标记互相独立，只有 CP-SAT 对相应目标（以及字典序决胜
   的每一步可行性）确已证明时才置为 `true`。
+
+## 六、执行核验（/executions/audit）回放规则
+
+核验**不调用求解器、不重新排产**：请求先经与 `/plans` 相同的 `PlanRequest`
+校验，再由 `build_instance` 构建基准，随后把 `executions` 按给定顺序逐条
+回放，段的开始/结束时刻完全采用实测值，因此空闲与实际耗时（含与基准
+`print_seconds` 不一致的实测耗时）都原样保留。每段检查：
+
+1. **串行不重叠**：`start_seconds` 不得小于上一已执行层段的 `end_seconds`
+   （首段不得早于 0，由字段约束保证）；零耗时层段首尾相接合法。
+2. **作业内层序**：第 k 段执行时第 k-1 段必须已在更早的序列位置出现；
+   跨作业交错本身不限制。
+3. **换料留时**：材料相对上一已执行层段（首段相对 `initial_material`）
+   不同时，段前空闲 `start - 上一段 end` 必须 `≥ switch_seconds`；
+   同材料不换料、无留时要求。
+4. **段前 purge**：换料时实测 `purge_before_mm3` 不得低于
+   `purge_matrix[from][to]`；同材料时必须为 0。容量一律按**实测值**
+   逐段累计扣减，累计超过总容量即在越界段记违规（余量如实给负值）。
+
+每条违规都带有序列位置 `order` 与 `(job_id, segment_index)`，同一层段可
+同时触发多条（如留时不足与 purge 不足）；重叠时该段不再重复记留时不足。
+作业在其全部层段集齐的那一刻按当时最后一段的实测结束时刻记完工，逾期
+`max(0, 完工时刻 - deadline)` 只对完工的作业累计——未完工前缀不计。
+存在任何违规即 `VIOLATED`（哪怕层段已全部提交）；无违规时按是否全部
+提交区分 `COMPLETED` / `IN_PROGRESS`。未知或重复层段、起止倒置等请求
+格式问题在 Pydantic 层拦截为 HTTP 422，不进入回放。
