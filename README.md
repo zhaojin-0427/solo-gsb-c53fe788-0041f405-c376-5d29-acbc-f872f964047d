@@ -1,8 +1,14 @@
-# 多材料 3D 打印换料规划 API
+# 多材料 3D 打印换料规划与执行核验 API
 
-基于 **Python + FastAPI + Google OR-Tools（CP-SAT）** 的排产服务。给定 2～8 个打印作业
-（每个作业由若干**按顺序执行的层段**组成）、初始材料、材料切换 purge 体积矩阵、
-单次切换耗时与总 purge 容量，计算层段交错执行计划：
+基于 **Python + FastAPI + Google OR-Tools（CP-SAT）** 的排产服务，提供两个接口：
+
+- **`POST /plans`**：给定 2～8 个打印作业（每个作业由若干**按顺序执行的层段**组成）、
+  初始材料、材料切换 purge 体积矩阵、单次切换耗时与总 purge 容量，计算层段交错执行计划；
+- **`POST /executions/audit`**：提交同一份规划参数和按**实际执行顺序**记录的已完成层段
+  （作业 ID、层序、实测起止秒、段前实测 purge），服务**保留空闲与实际耗时、不重新排产**，
+  逐段回放并核验换料间隔 / 段前 purge / 容量 / 层序 / 时间重叠，返回进行中、完成或违规状态。
+
+规划接口在 purge 容量与作业截止时间约束下：
 
 - 作业之间**只能在层段边界交错**，层段不可拆分，作业内层段严格按序；
 - 每次材料切换按 `purge_matrix[from][to]` 消耗 purge 容量，并占用 `switch_seconds` 秒
@@ -30,7 +36,12 @@
 docker compose up --build -d
 ```
 
-服务监听在宿主机 `http://localhost:8000`。查看日志 / 停止：
+服务监听在宿主机 `http://localhost:8000`，两个接口均可直接访问：
+
+- 规划：`POST http://localhost:8000/plans`
+- 执行核验：`POST http://localhost:8000/executions/audit`
+
+查看日志 / 停止：
 
 ```bash
 docker compose logs -f
@@ -65,6 +76,9 @@ pytest -q
 ```
 
 ## 三、调用接口
+
+- 规划：[`POST /plans`](#post-plans)
+- 执行核验：[`POST /executions/audit`](#post-executionsaudit执行核验)
 
 ### `POST /plans`
 
@@ -334,6 +348,302 @@ CP-SAT 可能来不及给出任何解，服务改用免求解的构造性候选�
 与上面相同的完整计划，`status` 为 `FEASIBLE` 且三个 `*_optimal` 标记均为
 `false`——不会误报 `UNKNOWN` 和空计划。
 
+### `POST /executions/audit`（执行核验）
+
+提交与 `POST /plans` **完全相同的规划参数**，另外加一个按**实际执行顺序**排列的
+`executions` 数组。服务先经 `PlanRequest` 校验、再用 `build_instance` 构建基准实例，
+随后按实测记录**逐段回放**——不做紧密重算：实测起止时刻、段间空闲、实测打印耗时
+全部原样保留，只检查执行过程是否合规。
+
+新增请求字段（`executions[]` 必填，允许空数组 `[]` 表示尚未开工）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `executions[].job_id` | 非空字符串 | 已完成层段所属作业 ID（必须存在于 `jobs`） |
+| `executions[].segment_index` | 正整数 | 作业内层段序号，从 1 开始（必须存在于该作业） |
+| `executions[].start_seconds` | 非负整数 | 实测开始时刻（相对开工时刻 0，秒） |
+| `executions[].end_seconds` | 非负整数 | 实测结束时刻（不得小于开始时刻） |
+| `executions[].purge_before_mm3` | 非负整数 | 该层段开始前**实测**排出的 purge 体积（mm³） |
+
+回放规则（逐段执行，材料以上一条已完成层段为准；首段以 `initial_material` 为准）：
+
+- **换料耗时**：材料变化时，本段开始与上一段结束之间必须留足 `switch_seconds`
+  （首段从时刻 0 起算）；间隔可以更长，多出部分记为空闲 `idle_seconds`；
+- **段前 purge**：换料时实测值不得低于 `purge_matrix[from][to]` 的需求，容量按
+  **实测值**扣减；**同材料时段前 purge 必须为 0**（同材料本就不该换料 / 排料）；
+- **跨作业可交错**，但每个作业的层序必须严格按 1、2、3… 连续递增（不得跳段、乱序）；
+- 后一条记录的开始不得早于上一条已完成层段的结束（时间不得重叠）；
+- 实测打印耗时与请求中声明的 `print_seconds` 允许不同——以实测为准，不判违规；
+- 仅当某作业**全部层段**都出现在记录中时才算完工，才按其最后层段实测结束时刻
+  核算逾期；**未完工前缀不计未完工作业逾期**。
+
+响应 `status`：
+
+| `status` | 条件 |
+| --- | --- |
+| `COMPLETED` | 全部层段均已提交（数量等于计划层段总数）且无任何违规 |
+| `IN_PROGRESS` | 尚无违规，但层段未交齐（含 `executions` 为空数组） |
+| `VIOLATED` | 回放中发现至少一处违规；即使层段交齐也**不能**标记完成 |
+
+违规代码（逐条给出 `execution_order` / `job_id` / `segment_index` / `message` / 实测值 / 要求值）：
+
+| `violations[].code` | 含义 |
+| --- | --- |
+| `OVERLAP` | 实测开始早于上一已完成层段结束，时间重叠 |
+| `LAYER_ORDER` | 作业内层序非法（跳段 / 乱序；跨作业交错本身合法） |
+| `SWITCH_TIME` | 换料间隔不足 `switch_seconds` |
+| `SAME_MATERIAL_PURGE` | 同材料相邻但段前实测 purge 非零（必须为 0） |
+| `PURGE_INSUFFICIENT` | 换料段前实测 purge 低于矩阵需求 |
+| `PURGE_OVER_CAPACITY` | 段前实测 purge 累计超过总容量（`purge_remaining_mm3` 为负） |
+
+#### 核验示例 1：合规完成（`examples/audit_completed.json`）
+
+请求体 = `examples/request.json` 的规划参数 + `executions`（实测与最优计划一致）：
+
+```json
+"executions": [
+  {"job_id": "J1", "segment_index": 1, "start_seconds": 0,   "end_seconds": 60,  "purge_before_mm3": 0},
+  {"job_id": "J1", "segment_index": 2, "start_seconds": 70,  "end_seconds": 100, "purge_before_mm3": 120},
+  {"job_id": "J2", "segment_index": 1, "start_seconds": 100, "end_seconds": 180, "purge_before_mm3": 0},
+  {"job_id": "J2", "segment_index": 2, "start_seconds": 190, "end_seconds": 210, "purge_before_mm3": 80}
+]
+```
+
+启动服务并调用（Docker Compose 一键启动见上一节；本地直跑监听同一端口）：
+
+```bash
+docker compose up --build -d
+
+curl -X POST http://localhost:8000/executions/audit \
+  -H 'Content-Type: application/json' \
+  -d @examples/audit_completed.json
+```
+
+**实际响应**：
+
+```json
+{
+  "status": "COMPLETED",
+  "executed_segment_count": 4,
+  "total_segment_count": 4,
+  "replay": [
+    {"order": 1, "job_id": "J1", "segment_index": 1, "material_id": "PLA",
+     "start_seconds": 0, "end_seconds": 60,
+     "actual_print_seconds": 60, "planned_print_seconds": 60,
+     "purge_before_mm3": 0, "required_purge_mm3": 0,
+     "switched": false, "switched_from_material": null,
+     "gap_seconds": 0, "required_switch_seconds": 0, "idle_seconds": 0},
+    {"order": 2, "job_id": "J1", "segment_index": 2, "material_id": "ABS",
+     "start_seconds": 70, "end_seconds": 100,
+     "actual_print_seconds": 30, "planned_print_seconds": 30,
+     "purge_before_mm3": 120, "required_purge_mm3": 120,
+     "switched": true, "switched_from_material": "PLA",
+     "gap_seconds": 10, "required_switch_seconds": 10, "idle_seconds": 0},
+    {"order": 3, "job_id": "J2", "segment_index": 1, "material_id": "ABS",
+     "start_seconds": 100, "end_seconds": 180,
+     "actual_print_seconds": 80, "planned_print_seconds": 80,
+     "purge_before_mm3": 0, "required_purge_mm3": 0,
+     "switched": false, "switched_from_material": null,
+     "gap_seconds": 0, "required_switch_seconds": 0, "idle_seconds": 0},
+    {"order": 4, "job_id": "J2", "segment_index": 2, "material_id": "PLA",
+     "start_seconds": 190, "end_seconds": 210,
+     "actual_print_seconds": 20, "planned_print_seconds": 20,
+     "purge_before_mm3": 80, "required_purge_mm3": 80,
+     "switched": true, "switched_from_material": "ABS",
+     "gap_seconds": 10, "required_switch_seconds": 10, "idle_seconds": 0}
+  ],
+  "switches": [
+    {"order": 1, "from_material": "PLA", "to_material": "ABS",
+     "after_execution_order": 1, "at_seconds": 60, "next_start_seconds": 70,
+     "gap_seconds": 10, "required_switch_seconds": 10,
+     "purge_before_mm3": 120, "required_purge_mm3": 120},
+    {"order": 2, "from_material": "ABS", "to_material": "PLA",
+     "after_execution_order": 3, "at_seconds": 180, "next_start_seconds": 190,
+     "gap_seconds": 10, "required_switch_seconds": 10,
+     "purge_before_mm3": 80, "required_purge_mm3": 80}
+  ],
+  "violations": [],
+  "violation_count": 0,
+  "purge_used_mm3": 200,
+  "purge_remaining_mm3": 200,
+  "completed_job_tardiness": [
+    {"job_id": "J1", "completion_seconds": 100, "deadline_seconds": 120, "tardy_seconds": 0},
+    {"job_id": "J2", "completion_seconds": 210, "deadline_seconds": 220, "tardy_seconds": 0}
+  ],
+  "total_tardiness_seconds": 0,
+  "makespan_seconds": 210
+}
+```
+
+要点：两次换料（PLA→ABS 实测 120、ABS→PLA 实测 80）都恰好满足矩阵需求且留足
+10s，同材料相邻的 J2.1 段前 purge 为 0；两作业均按期完工，`COMPLETED`。
+
+#### 核验示例 2：进行中，保留空闲与实测耗时（`examples/audit_in_progress.json`）
+
+只完成了 J1.1 与 J2.1，且实测耗时与计划不同（62s vs 60s、83s vs 80s）：
+
+```json
+"executions": [
+  {"job_id": "J1", "segment_index": 1, "start_seconds": 0,  "end_seconds": 62,  "purge_before_mm3": 0},
+  {"job_id": "J2", "segment_index": 1, "start_seconds": 72,  "end_seconds": 155, "purge_before_mm3": 120}
+]
+```
+
+```bash
+curl -X POST http://localhost:8000/executions/audit \
+  -H 'Content-Type: application/json' \
+  -d @examples/audit_in_progress.json
+```
+
+**实际响应**（节选）：
+
+```json
+{
+  "status": "IN_PROGRESS",
+  "executed_segment_count": 2,
+  "total_segment_count": 4,
+  "replay": [
+    {"order": 1, "job_id": "J1", "segment_index": 1, "material_id": "PLA",
+     "start_seconds": 0, "end_seconds": 62,
+     "actual_print_seconds": 62, "planned_print_seconds": 60,
+     "purge_before_mm3": 0, "required_purge_mm3": 0,
+     "switched": false, "switched_from_material": null,
+     "gap_seconds": 0, "required_switch_seconds": 0, "idle_seconds": 0},
+    {"order": 2, "job_id": "J2", "segment_index": 1, "material_id": "ABS",
+     "start_seconds": 72, "end_seconds": 155,
+     "actual_print_seconds": 83, "planned_print_seconds": 80,
+     "purge_before_mm3": 120, "required_purge_mm3": 120,
+     "switched": true, "switched_from_material": "PLA",
+     "gap_seconds": 10, "required_switch_seconds": 10, "idle_seconds": 0}
+  ],
+  "switches": [
+    {"order": 1, "from_material": "PLA", "to_material": "ABS",
+     "after_execution_order": 1, "at_seconds": 62, "next_start_seconds": 72,
+     "gap_seconds": 10, "required_switch_seconds": 10,
+     "purge_before_mm3": 120, "required_purge_mm3": 120}
+  ],
+  "violations": [],
+  "violation_count": 0,
+  "purge_used_mm3": 120,
+  "purge_remaining_mm3": 280,
+  "completed_job_tardiness": [],
+  "total_tardiness_seconds": 0,
+  "makespan_seconds": 155
+}
+```
+
+要点：`actual_print_seconds` 以实测为准（与 `planned_print_seconds` 并列给出），
+`makespan_seconds` 取实测末段结束时刻 155；J1、J2 都未交齐全部层段，
+`completed_job_tardiness` 为空、逾期不计（即使实测时刻已超过某截止值）。
+换料间隔若长于 `switch_seconds`，差额会计入该段的 `idle_seconds` 并原样保留。
+
+#### 核验示例 3：多处违规，不能标记完成（`examples/audit_violations.json`）
+
+容量改为 150 mm³，四条层段交齐但执行过程问题很多：J1.1 同材料却排了 5 mm³ purge；
+J1.2 换料只留 5s（需 10s）且 purge 仅 100（需 120）；J2.1 与上一段时间重叠；
+J2.2 换料只留 5s；累计实测 purge 185 超出容量 150：
+
+```json
+"switch_seconds": 10,
+"total_purge_capacity_mm3": 150,
+"executions": [
+  {"job_id": "J1", "segment_index": 1, "start_seconds": 0,   "end_seconds": 60,  "purge_before_mm3": 5},
+  {"job_id": "J1", "segment_index": 2, "start_seconds": 65,  "end_seconds": 95,  "purge_before_mm3": 100},
+  {"job_id": "J2", "segment_index": 1, "start_seconds": 90,  "end_seconds": 170, "purge_before_mm3": 0},
+  {"job_id": "J2", "segment_index": 2, "start_seconds": 175, "end_seconds": 195, "purge_before_mm3": 80}
+]
+```
+
+```bash
+curl -X POST http://localhost:8000/executions/audit \
+  -H 'Content-Type: application/json' \
+  -d @examples/audit_violations.json
+```
+
+**实际响应**（`replay` 与 `switches` 字段同上例结构，此处只列关键部分）：
+
+```json
+{
+  "status": "VIOLATED",
+  "executed_segment_count": 4,
+  "total_segment_count": 4,
+  "violations": [
+    {"code": "SAME_MATERIAL_PURGE", "execution_order": 1, "job_id": "J1", "segment_index": 1,
+     "message": "本段材料 PLA 与上一段相同，同材料段前 purge 必须为 0，实测 5 mm^3",
+     "actual": 5, "required": 0},
+    {"code": "SWITCH_TIME", "execution_order": 2, "job_id": "J1", "segment_index": 2,
+     "message": "材料由 PLA 换为 ABS，段前实测间隔仅 5s，不足 switch_seconds=10s",
+     "actual": 5, "required": 10},
+    {"code": "PURGE_INSUFFICIENT", "execution_order": 2, "job_id": "J1", "segment_index": 2,
+     "message": "材料由 PLA 换为 ABS，段前实测 purge 100 mm^3 低于矩阵需求 120 mm^3",
+     "actual": 100, "required": 120},
+    {"code": "OVERLAP", "execution_order": 3, "job_id": "J2", "segment_index": 1,
+     "message": "层段实测开始 90s 早于上一已完成层段结束 95s，时间重叠 5s",
+     "actual": 90, "required": 95},
+    {"code": "SWITCH_TIME", "execution_order": 4, "job_id": "J2", "segment_index": 2,
+     "message": "材料由 ABS 换为 PLA，段前实测间隔仅 5s，不足 switch_seconds=10s",
+     "actual": 5, "required": 10},
+    {"code": "PURGE_OVER_CAPACITY", "execution_order": 4, "job_id": "J2", "segment_index": 2,
+     "message": "段前 purge 后累计实测消耗 185 mm^3，超过总容量 150 mm^3",
+     "actual": 185, "required": 150}
+  ],
+  "violation_count": 6,
+  "purge_used_mm3": 185,
+  "purge_remaining_mm3": -35,
+  "completed_job_tardiness": [
+    {"job_id": "J1", "completion_seconds": 95,  "deadline_seconds": 120, "tardy_seconds": 0},
+    {"job_id": "J2", "completion_seconds": 195, "deadline_seconds": 220, "tardy_seconds": 0}
+  ],
+  "total_tardiness_seconds": 0,
+  "makespan_seconds": 195
+}
+```
+
+要点：四类问题按发生位置逐条累积（同一段可同时报多条，如第 2 条同时为换料耗时不足
+与 purge 不足）；容量始终按**实测值**（5+100+0+80=185）扣减，余量如实给出负数 -35；
+虽然四条层段都已交齐，但存在违规，状态是 `VIOLATED` 而**不是** `COMPLETED`。
+全部层段出现的作业其逾期仍照常核算（本例均未逾期）；未完工前缀则不会出现在
+`completed_job_tardiness` 中。
+
+#### 核验接口的非法请求（HTTP 422）
+
+`/executions/audit` 继承 `/plans` 的全部输入校验（作业数、矩阵完整性、非负等），
+另外对每条实测记录做引用 / 重复 / 时序校验。以下情况返回 **422**，不进入回放：
+
+- 引用了**未知作业**（`job_id` 不在 `jobs` 中）或**未知层段**（该作业没有此 `segment_index`）；
+- **重复层段**：同一 `(job_id, segment_index)` 出现两次；
+- **起止倒置**：`end_seconds < start_seconds`；
+- 缺少 `executions` 字段（注意：字段必须存在；传空数组 `[]` 合法，返回 `IN_PROGRESS`）；
+- 以及继承自 `/plans` 的全部 422 情形（作业数越界、`job_id` 重复、矩阵缺行缺列、
+  负数、对角非 0、额外字段等）。
+
+示例（重复层段）：
+
+```bash
+curl -i -X POST http://localhost:8000/executions/audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jobs": [
+      {"job_id": "J1", "deadline_seconds": 120, "segments": [
+        {"material_id": "PLA", "print_seconds": 60, "volume_mm3": 100},
+        {"material_id": "ABS", "print_seconds": 30, "volume_mm3": 40}]},
+      {"job_id": "J2", "deadline_seconds": 220, "segments": [
+        {"material_id": "ABS", "print_seconds": 80, "volume_mm3": 120},
+        {"material_id": "PLA", "print_seconds": 20, "volume_mm3": 30}]}
+    ],
+    "initial_material": "PLA",
+    "purge_matrix": {"PLA": {"PLA": 0, "ABS": 120}, "ABS": {"PLA": 80, "ABS": 0}},
+    "switch_seconds": 10,
+    "total_purge_capacity_mm3": 400,
+    "executions": [
+      {"job_id": "J1", "segment_index": 1, "start_seconds": 0,  "end_seconds": 60, "purge_before_mm3": 0},
+      {"job_id": "J1", "segment_index": 1, "start_seconds": 60, "end_seconds": 90, "purge_before_mm3": 0}
+    ]
+  }'
+# HTTP/1.1 422 Unprocessable Entity
+# ... "msg": "Value error, executions 第 2 条为重复层段: J1.1" ...
+```
+
 ### 求解状态语义
 
 | `status` | `optimal` | 含义 |
@@ -372,16 +682,21 @@ curl -i -X POST http://localhost:8000/plans \
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 应用：GET /health、POST /plans
-│   ├── schemas.py     # 请求/响应模型与 422 输入校验
-│   └── solver.py      # CP-SAT 建模、分阶段求解与字典序决胜
+│   ├── main.py        # FastAPI 应用：GET /health、POST /plans、POST /executions/audit
+│   ├── schemas.py     # 请求/响应模型与 422 输入校验（含执行核验模型）
+│   ├── solver.py      # CP-SAT 建模、分阶段求解与字典序决胜；build_instance 基准构建
+│   └── audit.py       # /executions/audit 逐段回放核验（保留空闲与实测耗时，不重排）
 ├── examples/
-│   ├── request.json              # 可行示例
+│   ├── request.json              # 可行示例（/plans）
 │   ├── request_long_job.json     # 长作业示例（单作业 25 段）
 │   ├── request_interleave.json   # 按材料交错示例（两个 25 段 A→B→A 作业，容量 2）
-│   └── request_infeasible.json   # 容量超限示例
+│   ├── request_infeasible.json   # 容量超限示例
+│   ├── audit_completed.json      # 执行核验：合规完成示例
+│   ├── audit_in_progress.json    # 执行核验：进行中前缀（保留空闲/实测耗时）示例
+│   └── audit_violations.json     # 执行核验：多处违规示例
 ├── tests/
-│   └── test_plans.py  # 16 个端到端测试（最优性、无解、交错、优先级、长作业、超时兜底、422 等）
+│   ├── test_plans.py  # 16 个端到端测试（最优性、无解、交错、优先级、长作业、超时兜底、422 等）
+│   └── test_audit.py  # 19 个执行核验测试（三态、空闲/实测保留、层序/重叠/换料/purge、逾期前缀、422 等）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -412,3 +727,21 @@ curl -i -X POST http://localhost:8000/plans \
   明细，状态如实标为 `FEASIBLE`，仅当兜底排列也超容时才返回 `UNKNOWN`。
   三级目标的最优性标记互相独立，只有 CP-SAT 对相应目标（以及字典序决胜
   的每一步可行性）确已证明时才置为 `true`。
+
+### 执行核验（`/executions/audit`）如何回放
+
+- 核验复用 `build_instance` 构建与 `/plans` 相同的基准实例（材料、矩阵、容量、
+  层序关系完全一致），但**不调用 CP-SAT、不重排时间线**：层段严格按
+  `executions` 给出的实际执行顺序逐段回放，实测起止、段间空闲与实测打印耗时
+  原样保留（回放结果同时给出 `actual_print_seconds` 与 `planned_print_seconds`
+  便于对照，二者不同不判违规）。
+- 每段的“上一材料”取上一条已完成层段的实测材料（首段取 `initial_material`）：
+  材料变化才允许排 purge（且不得低于矩阵需求、间隔不得短于 `switch_seconds`），
+  同材料段前 purge 必须为 0；容量按**段前实测值**逐段累加扣减，超容即记
+  `PURGE_OVER_CAPACITY`，余量为负时如实返回。
+- 层序合法性按**作业分别**维护“下一个应出现的层序”：跨作业可任意交错，
+  但每个作业只能连续递增地出现 1、2、3…；时间重叠按实际执行顺序逐对比较
+  （后段开始不得早于前段结束）。违规会逐段累积、互不短路，因此一次核验可
+  返回多个位置的多处问题；存在任何违规即 `VIOLATED`，层段交齐也不标完成。
+- 逾期只对**全部层段均已出现**的作业、按其最后层段实测结束时刻核算；
+  未完工前缀的作业不进入 `completed_job_tardiness`。
